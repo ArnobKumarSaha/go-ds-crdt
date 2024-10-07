@@ -37,13 +37,15 @@ var (
 	topicName = "globaldb-example"
 	netTopic  = "globaldb-example-net"
 	config    = "globaldb-example"
+
+	daemonMode    *bool
+	dataDir, port *string
 )
 
-func main() {
-	daemonMode := flag.Bool("daemon", false, "Run in daemon mode")
-	dataDir := flag.String("datadir", "", "Use a custom data directory")
-	port := flag.String("port", "0", "Specify the TCP port to listen on")
-
+func initStore() (*badger.Datastore, string) {
+	daemonMode = flag.Bool("daemon", false, "Run in daemon mode")
+	dataDir = flag.String("datadir", "", "Use a custom data directory")
+	port = flag.String("port", "0", "Specify the TCP port to listen on")
 	flag.Parse()
 
 	if *port != "" {
@@ -58,9 +60,6 @@ func main() {
 	crypto.MinRsaKeyBits = 1024
 
 	logging.SetLogLevel("*", "error")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	data := ""
 
 	if dataDir == nil || *dataDir == "" {
@@ -86,11 +85,14 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	defer store.Close()
 
+	return store, data
+}
+
+func generatePrivateKey(data string) crypto.PrivKey {
 	keyPath := filepath.Join(data, "key")
 	var priv crypto.PrivKey
-	_, err = os.Stat(keyPath)
+	_, err := os.Stat(keyPath)
 	if os.IsNotExist(err) {
 		priv, _, err = crypto.GenerateKeyPair(crypto.Ed25519, 1)
 		if err != nil {
@@ -117,11 +119,17 @@ func main() {
 		}
 
 	}
-	pid, err := peer.IDFromPublicKey(priv.GetPublic())
-	if err != nil {
-		logger.Fatal(err)
-	}
+	return priv
+}
 
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, data := initStore()
+	defer store.Close()
+
+	priv := generatePrivateKey(data)
 	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/" + *port)
 
 	h, dht, err := ipfslite.SetupLibp2p(
@@ -207,6 +215,11 @@ func main() {
 	defer crdt.Close()
 	defer psubCancel()
 
+	bootstrap(ipfs, h, topic, priv, data)
+	run(ctx, crdt, h, topic)
+}
+
+func bootstrap(ipfs *ipfslite.Peer, h host.Host, topic *pubsub.Topic, priv crypto.PrivKey, data string) {
 	fmt.Println("Bootstrapping...")
 
 	bstr, _ := multiaddr.NewMultiaddr("/ip4/94.130.135.167/tcp/33123/ipfs/12D3KooWFta2AE7oiK1ioqjVAKajUJauZWfeM7R413K7ARtHRDAu")
@@ -214,6 +227,11 @@ func main() {
 	list := append(ipfslite.DefaultBootstrapPeers(), *inf)
 	ipfs.Bootstrap(list)
 	h.ConnManager().TagPeer(inf.ID, "keep", 100)
+
+	pid, err := peer.IDFromPublicKey(priv.GetPublic())
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	fmt.Printf(`
 Peer ID: %s
@@ -250,7 +268,9 @@ Ready!
 		<-signalChan
 		return
 	}
+}
 
+func run(ctx context.Context, crdt *crdt.Datastore, h host.Host, topic *pubsub.Topic) {
 	commands := `
 > (l)ist                      -> list items in the store
 > (g)get <key>                -> get value for a key
